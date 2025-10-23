@@ -1,0 +1,197 @@
+clear; clc; close all;
+
+%% --- Load Robot Models and Attach a Virtual End Effector ------------------
+robotIK = importrobot('Tinkerkit_model/tinkerkit4DOF.urdf');
+robotViz = importrobot('Tinkerkit_model/tinkerkit.urdf');
+
+robotIK.DataFormat = 'struct';
+robotViz.DataFormat = 'struct';
+
+% Extend the wrist with a short virtual tool so the gripper contacts the part
+% without changing the source URDF files.
+endEffectorOffset = 0.16; % [m]
+endEffectorName = 'end_effector';
+
+functionBodyIK = robotics.RigidBody(endEffectorName);
+setFixedTransform(functionBodyIK.Joint, trvec2tform([0 0 endEffectorOffset]));
+addBody(robotIK, functionBodyIK, 'link4');
+
+functionBodyViz = robotics.RigidBody(endEffectorName);
+setFixedTransform(functionBodyViz.Joint, trvec2tform([0 0 endEffectorOffset]));
+addBody(robotViz, functionBodyViz, 'link4');
+
+%% --- Define Comfortable Home Configuration --------------------------------
+configIK = homeConfiguration(robotIK);
+configViz = homeConfiguration(robotViz);
+
+homeAngles = [pi/2; pi/2; pi/4; pi/4];
+for jointIdx = 1:4
+    configIK(jointIdx).JointPosition = homeAngles(jointIdx);
+    configViz(jointIdx).JointPosition = homeAngles(jointIdx);
+end
+
+configViz(5).JointPosition = 0;               % keep the wrist pitch vertical
+configViz(6).JointPosition = deg2rad(73);     % gripper open by default
+
+figure('Name', 'Initial Robot Pose');
+show(robotViz, configViz);
+title('Home Configuration');
+axis([-0.3 0.3 -0.3 0.3 -0.1 0.5]);
+view(135, 25);
+grid on;
+
+%% --- Waypoints for Pick and Place -----------------------------------------
+% Positions are expressed in the base frame.  Adjust them to match your scene.
+waypointNames = { ...
+    'home', ...
+    'approach_pick', ...
+    'pick', ...
+    'retreat_pick', ...
+    'transfer_mid', ...
+    'approach_drop', ...
+    'drop', ...
+    'retreat_drop', ...
+    'return_mid', ...
+    'home_final'};
+
+waypointPositions = [ ...
+    0.22,  0.00, 0.22;  % home
+    0.17,  0.08, 0.20;  % approach above the part
+    0.17,  0.08, 0.06;  % pick position
+    0.17,  0.08, 0.20;  % retreat back up
+    0.18,  0.00, 0.26;  % pass over the table center
+    0.06, -0.16, 0.18;  % approach over the drop location
+    0.06, -0.16, 0.06;  % drop position
+    0.06, -0.16, 0.18;  % retreat from the drop
+    0.18, -0.02, 0.24;  % re-center before heading home
+    0.22,  0.00, 0.22]; % return home
+
+% Visualize the raw waypoints and the smoothed spline track.
+figure('Name', 'Pick-and-Place Waypoints');
+plot3(waypointPositions(:,1), waypointPositions(:,2), waypointPositions(:,3), ...
+      'ko', 'MarkerFaceColor', 'k', 'MarkerSize', 8); hold on;
+text(waypointPositions(:,1), waypointPositions(:,2), waypointPositions(:,3)+0.01, ...
+     waypointNames, 'HorizontalAlignment', 'center');
+
+trajectorySpline = cscvn(waypointPositions');
+fnplt(trajectorySpline, 'r', 2);
+axis([-0.3 0.3 -0.3 0.3 -0.05 0.35]);
+view(135, 25);
+box on; grid on;
+xlabel('X [m]'); ylabel('Y [m]'); zlabel('Z [m]');
+title('Smooth Cartesian Path Through Pick-and-Place Waypoints');
+hold off;
+
+%% --- Sample the Smooth Trajectory -----------------------------------------
+segments = size(waypointPositions, 1);
+samplesPerSegment = 30;                 % increase for a denser path
+numSamples = segments * samplesPerSegment;
+
+curveParameter = linspace(0, trajectorySpline.breaks(end), numSamples);
+endEffectorTrack = ppval(trajectorySpline, curveParameter);
+
+%% --- Inverse Kinematics Across the Path -----------------------------------
+ik = robotics.InverseKinematics('RigidBodyTree', robotIK);
+ik.SolverAlgorithm = 'LevenbergMarquardt';
+poseWeights = [0 0 0 1 1 1];            % position only, keep orientation neutral
+
+configHistory = repmat(configIK, numSamples, 1);
+initialGuess = configIK;
+
+for sampleIdx = 1:numSamples
+    targetPose = trvec2tform(endEffectorTrack(:, sampleIdx)');
+    configHistory(sampleIdx, :) = ik(endEffectorName, targetPose, poseWeights, initialGuess);
+    initialGuess = configHistory(sampleIdx, :); % warm start the next solve
+end
+
+jointMatrix = zeros(numSamples, numel(homeAngles));
+for rowIdx = 1:numSamples
+    for jointIdx = 1:numel(homeAngles)
+        jointMatrix(rowIdx, jointIdx) = configHistory(rowIdx, jointIdx).JointPosition;
+    end
+end
+
+%% --- Determine When to Close / Open the Gripper ---------------------------
+lookupPoint = @(p) dsearchn(endEffectorTrack', p);
+pickupIndex = lookupPoint(waypointPositions(3, :));
+dropIndex   = lookupPoint(waypointPositions(7, :));
+
+closeCommandIndex = pickupIndex + 3;    % a few samples after reaching the pick
+openCommandIndex  = dropIndex   + 3;    % a few samples after reaching the drop
+
+%% --- Animate the Robot and the Object -------------------------------------
+figure('Name', 'Smooth Pick-and-Place Animation');
+hold on;
+fnplt(trajectorySpline, 'r', 2);
+plot3(waypointPositions(:,1), waypointPositions(:,2), waypointPositions(:,3), ...
+      'ko', 'MarkerFaceColor', 'k');
+objectHandle = plot3(waypointPositions(3,1), waypointPositions(3,2), ...
+                     waypointPositions(3,3), 's', 'MarkerFaceColor', [0.9 0.4 0.4], ...
+                     'MarkerSize', 12, 'MarkerEdgeColor', 'k');
+axis([-0.3 0.3 -0.3 0.3 -0.1 0.5]);
+view(135, 25);
+grid on;
+
+openGripAngle  = deg2rad(73);
+closedGripAngle = 0;
+objectMode = "table"; % "table" -> "carried" -> "dropped"
+
+for sampleIdx = 1:numSamples
+    % Update the 4 actuated joints from the IK result
+    for jointIdx = 1:4
+        configViz(jointIdx).JointPosition = jointMatrix(sampleIdx, jointIdx);
+    end
+
+    % Gripper state machine
+    switch objectMode
+        case "table"
+            configViz(6).JointPosition = openGripAngle;
+            if sampleIdx >= closeCommandIndex
+                configViz(6).JointPosition = closedGripAngle;
+                objectMode = "carried";
+            end
+        case "carried"
+            configViz(6).JointPosition = closedGripAngle;
+            if sampleIdx >= openCommandIndex
+                configViz(6).JointPosition = openGripAngle;
+                objectMode = "dropped";
+            end
+        case "dropped"
+            configViz(6).JointPosition = openGripAngle;
+    end
+
+    show(robotViz, configViz, 'PreservePlot', false, 'Frames', 'off');
+
+    % Update cube location depending on whether it is on the table, carried, or dropped
+    if objectMode == "carried"
+        eeTform = getTransform(robotViz, configViz, endEffectorName);
+        eePosition = tform2trvec(eeTform);
+        set(objectHandle, 'XData', eePosition(1), 'YData', eePosition(2), 'ZData', eePosition(3));
+    elseif objectMode == "dropped"
+        set(objectHandle, 'XData', waypointPositions(7,1), ...
+                          'YData', waypointPositions(7,2), ...
+                          'ZData', waypointPositions(7,3));
+    else
+        set(objectHandle, 'XData', waypointPositions(3,1), ...
+                          'YData', waypointPositions(3,2), ...
+                          'ZData', waypointPositions(3,3));
+    end
+
+    drawnow;
+end
+
+%% --- Plot Joint Command Profiles ------------------------------------------
+trajectoryDuration = 20; % [s] total motion time for command scheduling
+timeVector = linspace(0, trajectoryDuration, numSamples);
+jointCommandsDeg = rad2deg(jointMatrix);
+
+figure('Name', 'Joint Command Profiles');
+jointNames = {'Base', 'Shoulder', 'Elbow', 'Wrist'};
+for jointIdx = 1:4
+    subplot(2,2,jointIdx);
+    plot(timeVector, jointCommandsDeg(:, jointIdx), 'LineWidth', 1.2);
+    grid on;
+    xlabel('Time [s]');
+    ylabel('Angle [deg]');
+    title(sprintf('%s Motor Signal', jointNames{jointIdx}));
+end
